@@ -744,38 +744,84 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ─── VU-метр dBFS ─────────────────────────────────────────────────────────
+    // ─── VU-метр dBFS с детектором пиков ─────────────────────────────────────
+    //
+    // Peak hold: метка удерживается PEAK_HOLD_MS мс, затем плавно падает
+    // со скоростью PEAK_FALL_DB_PER_S дБ/с до уровня текущего сигнала.
 
     static class VuMeterView extends View {
-        private static final int   N      = 30;
-        private static final float MIN_DB = -60f;
+        private static final int   N               = 30;
+        private static final float MIN_DB          = -60f;
+        private static final long  PEAK_HOLD_MS    = 500;          // удержание
+        private static final float PEAK_FALL_DB_S  = 20f;          // скорость падения
 
-        private final Paint mSegPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint mLblPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final RectF mRect     = new RectF();
-        private float mLevelDb        = MIN_DB;
+        private final Paint mSegPaint  = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint mLblPaint  = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint mPeakPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF mRect      = new RectF();
+
+        private float mLevelDb  = MIN_DB;
+        private float mPeakDb   = MIN_DB;           // позиция метки пика
+        private long  mPeakTime = 0;                // когда пик был обновлён
+        private long  mLastTick = 0;                // для расчёта падения
+
+        private final Runnable mFallRunnable = this::tickPeak;
 
         VuMeterView(Context c) {
             super(c);
             mLblPaint.setColor(0xAAFFFFFF);
             mLblPaint.setTextAlign(Paint.Align.CENTER);
             mLblPaint.setTextSize(9f * c.getResources().getDisplayMetrics().density);
+
+            // Метка пика — белая вертикальная черта
+            mPeakPaint.setColor(0xFFFFFFFF);
+            mPeakPaint.setStyle(Paint.Style.STROKE);
+            mPeakPaint.setStrokeWidth(2f);
         }
 
         void setLevel(float rms) {
-            mLevelDb = rms > 1e-6f
+            float db = rms > 1e-6f
                 ? Math.max(MIN_DB, (float)(20.0 * Math.log10(rms)))
                 : MIN_DB;
+            mLevelDb = db;
+
+            // Обновляем пик если сигнал выше текущей метки
+            if (db >= mPeakDb) {
+                mPeakDb   = db;
+                mPeakTime = System.currentTimeMillis();
+                mLastTick = mPeakTime;
+            }
+
             postInvalidate();
+        }
+
+        // Вызывается из onDraw для анимации падения пика
+        private void tickPeak() {
+            long now     = System.currentTimeMillis();
+            long held    = now - mPeakTime;
+
+            if (held >= PEAK_HOLD_MS) {
+                // Фаза падения
+                float dt   = (now - mLastTick) / 1000f;
+                mPeakDb   -= PEAK_FALL_DB_S * dt;
+                if (mPeakDb <= mLevelDb || mPeakDb <= MIN_DB) {
+                    mPeakDb = Math.max(mLevelDb, MIN_DB);
+                }
+            }
+            mLastTick = now;
+
+            if (mPeakDb > MIN_DB)
+                postInvalidateDelayed(16);   // ~60 fps пока пик над полом
         }
 
         @Override
         protected void onDraw(Canvas canvas) {
-            final float w = getWidth(), h = getHeight();
+            final float w    = getWidth(), h = getHeight();
             final float segW = (w - N - 1f) / N;
             final float segH = h * 0.55f;
             final float segY = (h - segH) / 2f;
 
+            // ── Сегменты ──────────────────────────────────────────────────────
             for (int i = 0; i < N; i++) {
                 float segDb = MIN_DB + (float) i / N * (-MIN_DB);
                 boolean lit = mLevelDb >= segDb;
@@ -788,6 +834,25 @@ public class MainActivity extends Activity {
                 mRect.set(x, segY, x + segW, segY + segH);
                 canvas.drawRoundRect(mRect, 2f, 2f, mSegPaint);
             }
+
+            // ── Метка пика ────────────────────────────────────────────────────
+            if (mPeakDb > MIN_DB) {
+                float frac = (mPeakDb - MIN_DB) / (-MIN_DB);
+                float px   = 1f + frac * (w - 2f);
+
+                // Цвет метки совпадает с зоной
+                if      (mPeakDb < -12f) mPeakPaint.setColor(0xFFFFFFFF);
+                else if (mPeakDb <  -3f) mPeakPaint.setColor(0xFFFFCC00);
+                else                     mPeakPaint.setColor(0xFFFF3300);
+
+                canvas.drawLine(px, segY - 2f, px, segY + segH + 2f, mPeakPaint);
+
+                // Запустить анимацию падения
+                removeCallbacks(mFallRunnable);
+                post(mFallRunnable);
+            }
+
+            // ── Подписи шкалы ─────────────────────────────────────────────────
             for (int db : new int[]{-60, -48, -36, -24, -12, -6, -3, 0}) {
                 float frac = (db - MIN_DB) / (-MIN_DB);
                 canvas.drawText(db == 0 ? "0" : String.valueOf(db),
